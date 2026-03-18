@@ -8,14 +8,21 @@ from gnuradio import gr
 
 class doa_music(gr.sync_block):
     """
-    2D MUSIC DOA estimation block for a uniform circular or linear array.
+    2D MUSIC DOA estimation block for a uniform circular, linear, or L-shaped array.
     Inputs: one already-decimated vector per antenna channel
     Output: flattened 2D spectrum (elevation_bins * azimuth_bins) in float32
     """
-
+    """
+    Array geometry
+    ch0 -> (0, 0)
+    ch1 -> (d, 0)
+    ch2 -> (2d, 0)
+    ch3 -> (0, d)
+    ch4 -> (0, 2d)
+    """
     def __init__(
         self,
-        cpi_size=8192,               # now this is the vector length AT THE INPUT
+        cpi_size=8192,
         freq=433.0,
         array_dist=0.33,
         num_elements=5,
@@ -28,14 +35,19 @@ class doa_music(gr.sync_block):
         elevation_step_deg=1.0,
         signal_dimension=2,
         diag_loading=1e-3,
+        l_elements_x=None,
+        l_elements_y=None,
     ):
         self.cpi_size = int(cpi_size)
         self.freq = float(freq)
         self.array_dist = float(array_dist)
         self.num_elements = int(num_elements)
-        self.array_type = array_type
+        self.array_type = array_type.upper()
         self.signal_dimension = int(np.clip(signal_dimension, 1, num_elements - 1))
         self.diag_loading = float(max(diag_loading, 0.0))
+
+        self.l_elements_x = l_elements_x
+        self.l_elements_y = l_elements_y
 
         self.azimuth_min = float(azimuth_min)
         self.azimuth_max = float(azimuth_max)
@@ -93,11 +105,10 @@ class doa_music(gr.sync_block):
         )
 
     def work(self, input_items, output_items):
-        # Input is already decimated upstream.
         X = np.array(
             [input_items[i][0] for i in range(self.num_elements)],
             dtype=np.complex64
-        )  # shape: (num_elements, cpi_size)
+        )
 
         R = self.corr_matrix(X)
 
@@ -118,15 +129,57 @@ class doa_music(gr.sync_block):
         N = X.shape[1]
         return (X @ X.conj().T) / max(N, 1)
 
-    def gen_scanning_vectors_2d(self, M, wavelength, array_type, offset_deg=0.0):
-        if array_type == "UCA":
+    def get_array_coordinates(self):
+        """Return sensor coordinates x, y, z in meters."""
+        M = self.num_elements
+
+        if self.array_type == "UCA":
             x = self.array_radius_m * np.cos(2 * np.pi / M * np.arange(M))
             y = -self.array_radius_m * np.sin(2 * np.pi / M * np.arange(M))
             z = np.zeros(M, dtype=np.float32)
-        else:
+
+        elif self.array_type == "ULA":
             x = np.zeros(M, dtype=np.float32)
             y = -np.arange(M, dtype=np.float32) * self.element_spacing_m
             z = np.zeros(M, dtype=np.float32)
+
+        elif self.array_type == "L":
+            if self.l_elements_x is None or self.l_elements_y is None:
+                nx = (M + 1) // 2
+                ny = M - nx + 1
+            else:
+                nx = int(self.l_elements_x)
+                ny = int(self.l_elements_y)
+
+            if nx < 2 or ny < 2:
+                raise ValueError("L-shaped array requires at least 2 elements on each arm")
+            if nx + ny - 1 != M:
+                raise ValueError(
+                    f"For L-shaped array, l_elements_x + l_elements_y - 1 must equal num_elements "
+                    f"({nx} + {ny} - 1 != {M})"
+                )
+
+            d = self.element_spacing_m
+
+            # Horizontal arm including corner
+            x_arm = np.arange(nx, dtype=np.float32) * d
+            y_arm = np.zeros(nx, dtype=np.float32)
+
+            # Vertical arm excluding shared corner
+            x_vert = np.zeros(ny - 1, dtype=np.float32)
+            y_vert = np.arange(1, ny, dtype=np.float32) * d
+
+            x = np.concatenate([x_arm, x_vert])
+            y = np.concatenate([y_arm, y_vert])
+            z = np.zeros(M, dtype=np.float32)
+
+        else:
+            raise ValueError(f"Unsupported array_type: {self.array_type}")
+
+        return x, y, z
+
+    def gen_scanning_vectors_2d(self, M, wavelength, array_type, offset_deg=0.0):
+        x, y, z = self.get_array_coordinates()
 
         scanning_vectors = np.zeros(
             (M, self.azimuth_bins, self.elevation_bins),
