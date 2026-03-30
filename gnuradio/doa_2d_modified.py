@@ -4,14 +4,17 @@
 from gnuradio import blocks
 from gnuradio import gr
 from gnuradio import filter
+from gnuradio import fft
 from gnuradio.filter import firdes
+
 import sys
 import signal
+import threading
 
 from gnuradio import krakensdr
 import doa_music
 
-from PyQt5 import QtWidgets, QtCore
+from PyQt5 import QtWidgets, QtCore, QtGui
 import pyqtgraph as pg
 import numpy as np
 
@@ -19,11 +22,12 @@ import numpy as np
 class DOAHeatmap(QtWidgets.QWidget):
     updated = QtCore.pyqtSignal(np.ndarray)
 
-    def __init__(self, azimuths, elevations):
+    def __init__(self, azimuths, elevations, num_peaks=3):
         super().__init__()
 
         self.azimuths = np.asarray(azimuths, dtype=float)
         self.elevations = np.asarray(elevations, dtype=float)
+        self.num_peaks = max(1, int(num_peaks))
 
         self.az_bins = len(self.azimuths)
         self.el_bins = len(self.elevations)
@@ -44,27 +48,39 @@ class DOAHeatmap(QtWidgets.QWidget):
         self.cmap_item = pg.PColorMeshItem()
         self.plot_item.addItem(self.cmap_item)
 
-        self.hist = pg.HistogramLUTItem()
-        self.hist.setImageItem(self.cmap_item)
-        self.graphics.addItem(self.hist, row=0, col=1)
+        raw_lut = np.asarray(
+            pg.colormap.get("viridis").getLookupTable(0.0, 1.0, 256),
+            dtype=float
+        )
+        if raw_lut.ndim != 2 or raw_lut.shape[1] not in (3, 4):
+            raise ValueError(f"Unexpected LUT shape: {raw_lut.shape}")
+        if raw_lut.max() <= 1.0:
+            raw_lut = raw_lut * 255.0
+        raw_lut = np.clip(raw_lut, 0, 255).astype(np.uint8)
+        if raw_lut.shape[1] == 3:
+            alpha = np.full((raw_lut.shape[0], 1), 255, dtype=np.uint8)
+            raw_lut = np.hstack((raw_lut, alpha))
+
+        self._lut = [QtGui.QColor(int(r), int(g), int(b), int(a)) for r, g, b, a in raw_lut]
+        self.cmap_item.setLookupTable(self._lut)
+        self.cmap_item.setLevels((-100.0, 0.0))
 
         self._build_mesh_geometry()
         self._draw_polar_grid()
 
-        self.peak_marker = pg.ScatterPlotItem(
+        self.top_markers = pg.ScatterPlotItem(
             size=12,
             pen=pg.mkPen('w', width=2),
             brush=pg.mkBrush(255, 0, 0, 220),
             symbol='o'
         )
-        self.plot_item.addItem(self.peak_marker)
+        self.plot_item.addItem(self.top_markers)
 
-        self.peak_label = pg.TextItem(
-            text="",
-            color=(255, 255, 255),
-            anchor=(0, 1)
-        )
-        self.plot_item.addItem(self.peak_label)
+        self.peak_labels = []
+        for _ in range(self.num_peaks):
+            txt = pg.TextItem(text="", color=(255, 255, 255), anchor=(0, 1))
+            self.plot_item.addItem(txt)
+            self.peak_labels.append(txt)
 
         r_outer = self.radius_edges.max()
         pad = 0.08 * r_outer
@@ -135,6 +151,15 @@ class DOAHeatmap(QtWidgets.QWidget):
         th = np.deg2rad(az_deg)
         return r * np.cos(th), r * np.sin(th)
 
+    def _top_k_indices(self, Z, k):
+        flat = Z.ravel()
+        k = min(k, flat.size)
+        if k <= 0:
+            return np.empty((0,), dtype=int)
+        idx = np.argpartition(flat, -k)[-k:]
+        idx = idx[np.argsort(flat[idx])[::-1]]
+        return idx
+
     @QtCore.pyqtSlot(np.ndarray)
     def update_image(self, data):
         expected_len = self.el_bins * self.az_bins
@@ -144,35 +169,82 @@ class DOAHeatmap(QtWidgets.QWidget):
         Z = np.reshape(data, (self.el_bins, self.az_bins))
         self.cmap_item.setData(self.X, self.Y, Z)
 
-        peak_flat_idx = np.argmax(Z)
-        el_idx, az_idx = np.unravel_index(peak_flat_idx, Z.shape)
+        zmin = float(np.nanmin(Z))
+        zmax = float(np.nanmax(Z))
+        if np.isfinite(zmin) and np.isfinite(zmax):
+            if zmax <= zmin:
+                zmax = zmin + 1e-6
+            self.cmap_item.setLevels((zmin, zmax))
 
-        peak_az = float(self.azimuths[az_idx])
-        peak_el = float(self.elevations[el_idx])
-        peak_val = float(Z[el_idx, az_idx])
+        top_idx = self._top_k_indices(Z, self.num_peaks)
+        if top_idx.size == 0:
+            self.top_markers.setData([])
+            for label in self.peak_labels:
+                label.setText("")
+            return
 
-        x, y = self._peak_to_xy(peak_az, peak_el)
-        self.peak_marker.setData([x], [y])
-
+        spots = []
         label_d = 0.03 * max(self.radius_edges.max(), 1.0)
-        self.peak_label.setPos(x + label_d, y + label_d)
-        self.peak_label.setText(f"Az {peak_az:.1f}°\nEl {peak_el:.1f}°\n{peak_val:.1f} dB")
+
+        for rank, flat_idx in enumerate(top_idx, start=1):
+            el_idx, az_idx = np.unravel_index(flat_idx, Z.shape)
+            peak_az = float(self.azimuths[az_idx])
+            peak_el = float(self.elevations[el_idx])
+            peak_val = float(Z[el_idx, az_idx])
+            x, y = self._peak_to_xy(peak_az, peak_el)
+
+            spots.append({
+                'pos': (x, y),
+                'data': rank,
+                'size': 14 if rank == 1 else 11,
+                'brush': pg.mkBrush(255, 0, 0, 220) if rank == 1 else pg.mkBrush(255, 180, 0, 220),
+                'pen': pg.mkPen('w', width=2),
+                'symbol': 'o'
+            })
+
+            self.peak_labels[rank - 1].setPos(x + label_d, y + label_d * (1 + 0.5 * (rank - 1)))
+            self.peak_labels[rank - 1].setText(
+                f"#{rank} Az {peak_az:.1f}°\nEl {peak_el:.1f}°\n{peak_val:.1f} dB"
+            )
+
+        self.top_markers.setData(spots)
+
+        for idx in range(len(top_idx), self.num_peaks):
+            self.peak_labels[idx].setText("")
 
 
 class VectorSinkCallback(gr.sync_block):
-    def __init__(self, heatmap_widget, vector_len):
+    """GNU Radio sink block with single-frame flow control."""
+    def __init__(self, vector_len):
         gr.sync_block.__init__(
             self,
             name="vector_sink_callback",
             in_sig=[(np.float32, vector_len)],
             out_sig=[]
         )
-        self.heatmap_widget = heatmap_widget
+        self.vector_len = vector_len
+        self._lock = threading.Lock()
+        self._latest = None
+        self.frames_in = 0
+        self.frames_dropped = 0
 
     def work(self, input_items, output_items):
         for vec in input_items[0]:
-            self.heatmap_widget.updated.emit(vec)
+            arr = np.array(vec, copy=True)
+            with self._lock:
+                if self._latest is not None:
+                    self.frames_dropped += 1
+                self._latest = arr
+                self.frames_in += 1
         return len(input_items[0])
+
+    def pop_latest(self):
+        with self._lock:
+            if self._latest is None:
+                return None
+            out = self._latest
+            self._latest = None
+            return out
 
 
 class doa_2d(gr.top_block):
@@ -183,8 +255,8 @@ class doa_2d(gr.top_block):
         # Variables
         ##################################################
         self.samp_rate = 2_400_000
-        self.center_freq = 903.0e6
-        self.signal_offset_hz = 0.0          # set this if the LoRa signal is offset from DC
+        self.center_freq = 450.0e6
+        self.signal_offset_hz = 0.0
         self.decimation = 4
         self.post_rate = self.samp_rate / self.decimation
 
@@ -204,12 +276,6 @@ class doa_2d(gr.top_block):
         ##################################################
         # Channel-select / decimation filter
         ##################################################
-        # For a 250 kHz LoRa signal:
-        # - passband should safely include the occupied bandwidth
-        # - output rate after decim=4 is 600 kS/s
-        # - Nyquist at output is 300 kHz
-        #
-        # These are good starting values:
         self.lpf_cutoff = 150e3
         self.lpf_transition = 50e3
 
@@ -218,7 +284,7 @@ class doa_2d(gr.top_block):
             self.samp_rate,
             self.lpf_cutoff,
             self.lpf_transition,
-            firdes.WIN_HAMMING
+            fft.window.WIN_HAMMING
         )
 
         self.channel_filters = []
@@ -243,19 +309,21 @@ class doa_2d(gr.top_block):
         # MUSIC block
         ##################################################
         self.music_block = doa_music.doa_music(
-            cpi_size=self.cpi_size,          # already-decimated vector length
-            freq=903.0,                      # MHz
+            cpi_size=self.cpi_size,
+            freq=903.0,
             array_dist=0.1413,
             num_elements=self.num_elements,
             array_type='UCA',
             azimuth_min=0.0,
             azimuth_max=359.0,
-            azimuth_step_deg=1.0,
+            azimuth_step_deg=10.0,
             elevation_min=0.0,
             elevation_max=90.0,
-            elevation_step_deg=1.0,
-            signal_dimension=1,
-            diag_loading=1e-3
+            elevation_step_deg=10.0,
+            signal_dimension=3,
+            diag_loading=0,
+            l_elements_x=3,
+            l_elements_y=3
         )
 
         ##################################################
@@ -263,11 +331,17 @@ class doa_2d(gr.top_block):
         ##################################################
         self.heatmap_widget = DOAHeatmap(
             azimuths=self.music_block.azimuths,
-            elevations=self.music_block.elevations
+            elevations=self.music_block.elevations,
+            num_peaks=3,
         )
 
         vector_len = len(self.music_block.azimuths) * len(self.music_block.elevations)
-        self.vector_sink = VectorSinkCallback(self.heatmap_widget, vector_len)
+        self.vector_sink = VectorSinkCallback(vector_len)
+
+        self.gui_fps = 15
+        self.gui_timer = QtCore.QTimer()
+        self.gui_timer.timeout.connect(self._update_gui_from_sink)
+        self.gui_timer.start(int(1000 / self.gui_fps))
 
         ##################################################
         # Connections
@@ -278,6 +352,11 @@ class doa_2d(gr.top_block):
             self.connect((self.stream_to_vector_blocks[i], 0), (self.music_block, i))
 
         self.connect((self.music_block, 0), (self.vector_sink, 0))
+
+    def _update_gui_from_sink(self):
+        vec = self.vector_sink.pop_latest()
+        if vec is not None:
+            self.heatmap_widget.update_image(vec)
 
 
 def main():

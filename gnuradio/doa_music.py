@@ -200,21 +200,24 @@ class doa_music(gr.sync_block):
 
         return np.ascontiguousarray(scanning_vectors)
 
-    def DOA_MUSIC_2D(self, R, scanning_vectors, signal_dimension=1):
-        _, vi = lin.eigh(R)
-
-        noise_dimension = R.shape[0] - signal_dimension
-        E = vi[:, :noise_dimension]
-
+    def DOA_MUSIC_2D(self, R, scanning_vectors, signal_dimension=1, mvdr=True):
         M = scanning_vectors.shape[0]
         A = scanning_vectors.reshape(M, -1)
-
-        proj = E.conj().T @ A
-        denom = np.sum(np.abs(proj) ** 2, axis=0)
-
+        if (mvdr):
+            R_inv = np.linalg.inv(R)
+            L = np.linalg.cholesky(R_inv)
+            proj = L.conj().T @ A
+            denom = np.sum(np.abs(proj) ** 2, axis=0)    		    
+        else:
+            _, vi = lin.eigh(R)
+            noise_dimension = R.shape[0] - signal_dimension
+            E = vi[:, :noise_dimension]
+            proj = E.conj().T @ A
+            denom = np.sum(np.abs(proj) ** 2, axis=0)
         spectrum = 1.0 / np.maximum(denom, 1e-12)
         return spectrum.reshape(self.azimuth_bins, self.elevation_bins)
-
+    
+	
     def DOA_plot_util_2d(self, doa_data, log_scale_min=-100):
         doa_data = np.abs(doa_data)
         doa_data /= np.maximum(np.max(doa_data), 1e-12)
